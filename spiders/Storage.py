@@ -5,7 +5,9 @@ __Date__      :  2019/11/15
 __File__      :  Storage.py
 __Desc__      :
 """
+import time
 import asyncio
+from contextlib import asynccontextmanager
 import aiomysql
 import pymysql
 # REW:PooledDB 线程间共享
@@ -15,7 +17,7 @@ path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(path)
 from spiders.Items import UserItems,ArticleItems
 from config import Config as CF
-__all__ = ["PDBC"]
+__all__ = ["ADBC"]
 
 async def register_pool(cfg):
     try:
@@ -44,73 +46,130 @@ class Singleton(type):  # REW: 元类单例
         return cls._instance
 
 
+class ADBC(metaclass=Singleton):
+
+    def __init__(self):
+        self.pool = None
+        self.conn = None
+        self.cur = None
+
+    async def initpool(self,**cfg):
+        _pool = await aiomysql.create_pool(**cfg)
+        self.pool = _pool
+        return _pool
+
+    @asynccontextmanager
+    async def auto_db(self):
+        try:
+            conn: aiomysql.Connection = await self.pool.acquire()
+            cur: aiomysql.Cursor = await conn.cursor()
+            yield (cur,conn)
+        finally:
+            if cur:
+                await cur.close()
+            if conn:
+                await self.pool.release(conn)
+
+    # 插入\更新\删除sql
+    async def insert(self, cur,con,sql):
+        await cur.execute(sql)
+        # FIXME: 优化
+        await con.commit()
+        insert_num = cur.rowcount
+        return insert_num
+
+    # 查询
+    async def select(self,cur, sql):
+        await cur.execute(sql)  # 执行sql
+        (select_res,) = await cur.fetchall()  # 返回结果为字典
+        return select_res
+
+    # 释放资源
+    async def dispose(self):
+        if self.conn:
+            await self.conn.close()
+        if self.cur:
+            await self.cur.close()
+        self.pool.close()
+        await self.pool.wait_closed()
+
+# 因为协程也只是一个线程，
 class PDBC(metaclass=Singleton):
     __pool = None
-
     def __init__(self,cfg):
+        self.cfg = cfg
+        self.conn = None
         # 构造函数，创建数据库连接、游标
-        self.coon = PDBC.getmysqlconn(**cfg)  # REW:静态方法
-        self.cur = self.coon.cursor(cursor=pymysql.cursors.DictCursor)
+        # self.coon = PDBC.getmysqlconn(**cfg)  # REW:静态方法
+        self.cur = None
 
     # 数据库连接池连接
     @staticmethod
     def getmysqlconn(**cfg):
         if PDBC.__pool is None:
-            __pool = PooledDB(creator=pymysql,**cfg)
-        return __pool.connection()
+            PDBC.__pool = PooledDB(creator=pymysql,**cfg)
+        return PDBC.__pool.connection()
+
+    def __enter__(self):
+        time.sleep(15)
+        self.conn = PDBC.getmysqlconn(**self.cfg)
+        self.cur = self.conn.cursor(cursor=pymysql.cursors.DictCursor)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cur.close()
+        PDBC.__pool.cache(self.conn)
 
     # 插入\更新\删除sql
     def insert(self, sql):
         insert_num = self.cur.execute(sql)
-        self.coon.commit()
+        # FIXME: 优化
+        self.conn.commit()
         return insert_num
 
     # 查询
     def select(self, sql):
         self.cur.execute(sql)  # 执行sql
-        select_res = self.cur.fetchone()  # 返回结果为字典
+        select_res = self.cur.fetchall()  # 返回结果为字典
         return select_res
 
     # 释放资源
     def dispose(self):
-        self.coon.close()
-        self.cur.close()
+        if self.conn:
+            self.conn.close()
+        if self.cur:
+            self.cur.close()
+        PDBC.__pool.close()
 
+async def Testaiomysql(adb,i):
+
+    sql = f"insert into tmpt values({i},'sfsf')"
+    async with adb.auto_db() as ad:
+        q = await adb.insert(*ad, sql)
+        print(f"execute {i} success")
 
 if __name__ == "__main__":
     # pass
     # import requests
     # 数据库连接池
-    pool_config = CF.mysql_config.copy()
-    pool_config.update(CF.mysql_cached_config)
-    pdbc = PDBC(pool_config)
-    user_item = UserItems()
-    a_item = ArticleItems()
-    user_item['url'] = "sf"
-    user_item['name'] = "sf"
-    user_item['creates'] = 3
-    user_item['fans'] ="2"
-    user_item['praises'] = 5
-    user_item['comments'] = 1
-    user_item['visits'] = "3"
-    user_item['grade'] =5
-    user_item['credits'] = "6"
-    # todo:解析具体的18万+
-    user_item['ranks'] = "13"
-    user_item['badges'] = "圣手"
+    # pool_config = CF.mysql_config.copy()
+    # pool_config.update(CF.mysql_cached_config)
+    import asyncio
 
-    a_item['title'] = "fs"
-    a_item['create_tiem"'] = '2019-08-12'
-    a_item['read_count'] = 3
-    a_item['nature'] = "sf"
-    a_item['content'] = "hhhhhhhhhhhhh"
-    a_item['praises'] = 3
-    a_item['comments'] = 5
-    a_item['url'] = "https://blog.csdn.net/anqixiang/article/details/102727604"
-    a_item['user_name'] = "iiiiiii"
-
-    result = user_item.unapply()
-    sql = "insert into user_info  values (null,'{}','{}','{}','{}','{}','{}'," \
-          "'{}','{}','{}','{}','{}')".format(*result)
-    r = pdbc.insert(sql)
-    print(r)
+    mysql_config = {
+        "host": "localhost",
+        "port": 3306,
+        "user": "root",
+        "password": "123456",
+        "db": "pblog"
+    }
+    loop = asyncio.get_event_loop()
+    adbc = ADBC()
+    pool = loop.run_until_complete(adbc.initpool(**mysql_config))
+    adbc.pool = pool
+    print(pool)
+    time.sleep(5)
+    r = []
+    for i in range(50):
+        r.append(asyncio.ensure_future(Testaiomysql(adbc,i)))
+    loop.run_until_complete(asyncio.gather(*r))
